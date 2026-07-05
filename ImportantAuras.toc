@@ -1,0 +1,32 @@
+## Interface: 120000
+## Title: Important Auras
+## Notes: Show icons for specific debuffs/buffs by spell ID, using StatusBar secret-value matching.
+## Author: Marminator
+## Version: 0.2-prototype
+## SavedVariables: ImportantAurasDB
+## IconTexture: Interface\Icons\Spell_Shadow_ShadowWordPain
+
+# NOTE: adjust "## Interface" to your live client's build if this shows as out-of-date.
+
+# Libraries
+Libs\LibStub\LibStub.lua
+Libs\CallbackHandler-1.0\CallbackHandler-1.0.xml
+Libs\AceAddon-3.0\AceAddon-3.0.xml
+Libs\AceConsole-3.0\AceConsole-3.0.xml
+Libs\AceEvent-3.0\AceEvent-3.0.xml
+Libs\AceDB-3.0\AceDB-3.0.xml
+Libs\AceGUI-3.0\AceGUI-3.0.xml
+Libs\AceConfig-3.0\AceConfig-3.0.xml
+Libs\LibGetFrame-1.0\LibGetFrame-1.0.xml
+
+# Addon
+Config.lua
+FrameAnchor.lua
+Stack.lua
+StackManager.lua
+NameplateStackManager.lua
+Data\SpellDB.lua
+SpellSearch.lua
+SpellSearchBox.lua
+Options.lua
+Core.lua

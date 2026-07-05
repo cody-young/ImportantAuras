@@ -1,0 +1,21 @@
+package-as: ImportantAuras
+
+# Ace3 libraries are not committed to the repo; the packager checks them out
+# fresh into Libs/ when building a release.
+externals:
+  Libs/LibStub: https://repos.wowace.com/wow/ace3/trunk/LibStub
+  Libs/CallbackHandler-1.0: https://repos.wowace.com/wow/ace3/trunk/CallbackHandler-1.0
+  Libs/AceAddon-3.0: https://repos.wowace.com/wow/ace3/trunk/AceAddon-3.0
+  Libs/AceConsole-3.0: https://repos.wowace.com/wow/ace3/trunk/AceConsole-3.0
+  Libs/AceEvent-3.0: https://repos.wowace.com/wow/ace3/trunk/AceEvent-3.0
+  Libs/AceDB-3.0: https://repos.wowace.com/wow/ace3/trunk/AceDB-3.0
+  Libs/AceGUI-3.0: https://repos.wowace.com/wow/ace3/trunk/AceGUI-3.0
+  Libs/AceConfig-3.0: https://repos.wowace.com/wow/ace3/trunk/AceConfig-3.0
+  # LibGetFrame-1.0 has no recovered external repo URL (vendored from a
+  # local copy) -- keep it committed to the repo instead of listing as an
+  # external, and refresh manually when a new version is needed.
+
+# Dev-only files kept out of the packaged release.
+ignore:
+  - CLAUDE.md
+  - .claude
