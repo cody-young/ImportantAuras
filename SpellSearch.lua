@@ -33,25 +33,37 @@ local function BuildCache()
 
     if C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines and C_SpellBook.GetSpellBookSkillLineInfo
             and C_SpellBook.GetSpellBookItemInfo and Enum.SpellBookItemType then
-        local banks = { Enum.SpellBookSpellBank.Player }
-        if C_SpellBook.HasPetSpells and C_SpellBook.HasPetSpells() then
-            banks[#banks + 1] = Enum.SpellBookSpellBank.Pet
+        -- Player bank: skill lines carry the index ranges.
+        local ok, numLines = pcall(C_SpellBook.GetNumSpellBookSkillLines)
+        if ok and numLines then
+            for i = 1, numLines do
+                local okLine, lineInfo = pcall(C_SpellBook.GetSpellBookSkillLineInfo, i)
+                if okLine and lineInfo then
+                    local offset = lineInfo.itemIndexOffset or 0
+                    local count = lineInfo.numSpellBookItems or 0
+                    for j = offset + 1, offset + count do
+                        local okItem, item = pcall(C_SpellBook.GetSpellBookItemInfo, j,
+                            Enum.SpellBookSpellBank.Player)
+                        if okItem and item and item.itemType == Enum.SpellBookItemType.Spell then
+                            AddEntry(list, seen, item.spellID or item.actionID, item.name, item.iconID)
+                        end
+                    end
+                end
+            end
         end
 
-        for _, bank in ipairs(banks) do
-            local ok, numLines = pcall(C_SpellBook.GetNumSpellBookSkillLines)
-            if ok and numLines then
-                for i = 1, numLines do
-                    local okLine, lineInfo = pcall(C_SpellBook.GetSpellBookSkillLineInfo, i)
-                    if okLine and lineInfo then
-                        local offset = lineInfo.itemIndexOffset or 0
-                        local count = lineInfo.numSpellBookItems or 0
-                        for j = offset + 1, offset + count do
-                            local okItem, item = pcall(C_SpellBook.GetSpellBookItemInfo, j, bank)
-                            if okItem and item and item.itemType == Enum.SpellBookItemType.Spell then
-                                AddEntry(list, seen, item.spellID or item.actionID, item.name, item.iconID)
-                            end
-                        end
+        -- Pet bank: NOT organized into skill lines -- HasPetSpells() returns
+        -- the pet spell count and items are indexed 1..count directly.
+        -- (Iterating the player skill-line offsets against the pet bank, as
+        -- an earlier version did, reads mostly out-of-range indices.)
+        if C_SpellBook.HasPetSpells then
+            local okPet, numPet = pcall(C_SpellBook.HasPetSpells)
+            if okPet and numPet then
+                for j = 1, numPet do
+                    local okItem, item = pcall(C_SpellBook.GetSpellBookItemInfo, j,
+                        Enum.SpellBookSpellBank.Pet)
+                    if okItem and item and item.itemType == Enum.SpellBookItemType.Spell then
+                        AddEntry(list, seen, item.spellID or item.actionID, item.name, item.iconID)
                     end
                 end
             end

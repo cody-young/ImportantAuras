@@ -134,3 +134,10 @@ end
 function NameplateStackManager.ForEach(fn)
     for _, e in pairs(live) do fn(e.stack) end
 end
+
+-- Run fn over the live instance of ONE stack id, if any (used by Preview;
+-- there's nothing to preview when no target plate is on screen).
+function NameplateStackManager.ForStack(id, fn)
+    local e = live[id]
+    if e then fn(e.stack) end
+end

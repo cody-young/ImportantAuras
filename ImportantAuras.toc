@@ -28,5 +28,7 @@ NameplateStackManager.lua
 Data\SpellDB.lua
 SpellSearch.lua
 SpellSearchBox.lua
+Transfer.lua
+Presets.lua
 Options.lua
 Core.lua

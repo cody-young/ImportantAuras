@@ -4,26 +4,33 @@ local addonName, ID = ...
 -- AceDB-backed saved variables: profile.stacks[stackID] = { ... }
 --
 -- stack (kind == "unit"):
---   name, kind="unit", enabled, unit ("player"|"target"|...|"arena5"|...),
+--   name, kind="unit", enabled, group (free-text label; stacks sharing one
+--   are shown together in the options tree and export/import as a set),
+--   units = {"player","party1",...} (ORDERED list -- the stack fans out to
+--   one display instance per token, Next Features #12; replaces the old
+--   single `unit` field, migrated in InitDB),
 --   filter ("HARMFUL"|"HELPFUL"|"CAST"), targets = {[spellID]=true},
 --   order = {spellID,...}, layout ("stack"|"row"), iconSize, spacing, bg,
---   panel, panelPad, locked, castDuration (seconds a CAST match flashes for;
---   unused for HARMFUL/HELPFUL), showCooldown (masked cooldown swipe on
---   matched icons; unused for CAST -- no duration data in that path),
+--   panel, panelPad, locked, castDuration (seconds a CAST match flashes for
+--   when the cast spell has NO cooldown -- fallback only since Next Features
+--   #14; unused for HARMFUL/HELPFUL), showCooldown (masked cooldown drain on
+--   matched icons: aura remaining duration, or the cast spell's cooldown),
 --   anchor = { useFrame, myPoint, relPoint, x, y, point (free-float fallback) }
 --
 -- stack (kind == "nameplate"):
---   name, kind="nameplate", enabled -- always follows the player's CURRENT
+--   name, kind="nameplate", enabled, group -- always follows the player's CURRENT
 --     TARGET's nameplate (resolved via C_NamePlate.GetNamePlateForUnit, see
 --     NameplateStackManager); no scope/name-matching options,
 --   filter, targets, order, layout, iconSize, spacing, castDuration,
 --   anchor = { myPoint, relPoint, x, y }  -- no free-float, no lock
 --
 -- filter == "CAST": instead of scanning ongoing auras, the stack listens for
--- UNIT_SPELLCAST_SUCCEEDED on its unit and flashes the matching tracked
--- spell's icon in slot 1 for `castDuration` seconds (see Stack:OnCast). A
--- cast is a momentary event with no "end" to scan back down from, unlike an
--- aura's presence/absence, hence the timer instead of a continuous scan.
+-- UNIT_SPELLCAST_SUCCEEDED on its unit and shows the matching tracked
+-- spell's icon in slot 1 for that spell's COOLDOWN with a cooldown swipe
+-- (Next Features #14; `castDuration` seconds when the spell has no cooldown
+-- -- see Stack:OnCast/ResolveCastCooldown). A cast is a momentary event with
+-- no "end" to scan back down from, unlike an aura's presence/absence, hence
+-- timers instead of a continuous scan.
 -- =========================================================================
 
 local function deepcopy(t)
@@ -38,12 +45,15 @@ end
 -- `copyDefaults` works), so a starter stack living there would silently
 -- resurrect itself after being deleted. Instead this is seeded once, below,
 -- only if the profile has no stacks at all yet (fresh install).
-local function NewDefaultStack()
+-- Exposed on ID so Options.lua's "Add stack", Presets.lua, and Transfer.lua's
+-- import sanitizer all build from the same canonical shape.
+function ID.NewDefaultStack()
     return {
         name     = "Player",
         kind     = "unit",
         enabled  = true,
-        unit     = "player",
+        group    = "",
+        units    = { "player" },
         filter   = "HARMFUL",
         -- A couple of well-known IDs so a fresh install shows *something*.
         targets  = { [589] = true, [980] = true },
@@ -51,8 +61,10 @@ local function NewDefaultStack()
         layout   = "stack",
         iconSize = 36,
         spacing  = 4,
+        growth   = "VERTICAL", -- CAST fan-out axis (see FrameAnchor)
+        align    = "LEFT",     -- CAST fan-out justification
         bg       = { 0.05, 0.05, 0.05, 0.85 },
-        panel    = true,
+        panel    = false,
         panelPad = 3,
         locked   = false,
         castDuration = 2,
@@ -73,6 +85,26 @@ local DEFAULTS = {
         stacks = {},
     },
 }
+
+-- Ordered list of unit tokens a unit-kind stack may fan out to (Next
+-- Features #12). Order drives the options GUI's toggle layout, the saved
+-- `units` array, and the on-screen free-float column order. NOTE: WoW has no
+-- "party5" token -- a 5-player group is player + party1..party4 -- and
+-- current arenas cap at 3 enemies (arena1..arena3 + their pets).
+ID.UNIT_TOKEN_ORDER = {
+    "player", "target", "focus", "pet",
+    "party1", "party2", "party3", "party4",
+    "arena1", "arena2", "arena3",
+    "arenapet1", "arenapet2", "arenapet3",
+    "boss1", "boss2", "boss3", "boss4", "boss5",
+}
+
+function ID.NewStackID()
+    local db = ID.db.profile
+    local id = tostring(db.nextStackID)
+    db.nextStackID = db.nextStackID + 1
+    return id
+end
 
 -- Reconcile a single stack's priority order against its target set (targets
 -- is the source of membership truth; order only ranks it). Drop stale/dup
@@ -105,13 +137,16 @@ local function ExtractLegacyStack(old)
         name     = "Player",
         kind     = "unit",
         enabled  = true,
-        unit     = old.unit or "player",
+        group    = "",
+        units    = { old.unit or "player" },
         filter   = old.filter or "HARMFUL",
         targets  = deepcopy(old.targets) or {},
         order    = deepcopy(old.order) or {},
         layout   = old.layout or "stack",
         iconSize = old.iconSize or 36,
         spacing  = old.spacing or 4,
+        growth   = old.growth or "VERTICAL",
+        align    = old.align or "LEFT",
         bg       = deepcopy(old.bg) or { 0.05, 0.05, 0.05, 0.85 },
         panel    = old.panel ~= false,
         panelPad = old.panelPad or 3,
@@ -148,12 +183,20 @@ function ID.InitDB()
         -- brand new install, nothing to migrate: seed one example stack
         local id = tostring(ID.db.profile.nextStackID)
         ID.db.profile.nextStackID = ID.db.profile.nextStackID + 1
-        ID.db.profile.stacks[id] = NewDefaultStack()
+        ID.db.profile.stacks[id] = ID.NewDefaultStack()
     end
 
     for _, stack in pairs(ID.db.profile.stacks) do
         ID.ReconcileOrder(stack)
         if stack.showCooldown == nil then stack.showCooldown = true end
+        if stack.growth == nil then stack.growth = "VERTICAL" end
+        if stack.align == nil then stack.align = "LEFT" end
+        -- single `unit` -> ordered `units` list (Next Features #12)
+        if stack.units == nil then
+            stack.units = { stack.unit or "player" }
+        end
+        stack.unit = nil
+        if stack.group == nil then stack.group = "" end
     end
 
     return ID.db
@@ -184,7 +227,7 @@ SlashCmdList["IMPORTANTAURAS"] = function(msg)
         ID.db:ResetProfile()
         local id = tostring(ID.db.profile.nextStackID)
         ID.db.profile.nextStackID = ID.db.profile.nextStackID + 1
-        ID.db.profile.stacks[id] = NewDefaultStack()
+        ID.db.profile.stacks[id] = ID.NewDefaultStack()
         ID.ReconcileOrder(ID.db.profile.stacks[id])
         ID.RefreshAll()
         if ID.Options and ID.Options.Rebuild then ID.Options.Rebuild() end

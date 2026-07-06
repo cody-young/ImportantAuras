@@ -69,6 +69,36 @@ reconciles `db.order` against `db.targets` (drop stale, append missing sorted).
   load-bearing premise and it holds.
 - Aura *enumeration* works (`GetAuraDataByIndex` + nil-break); only the spellId
   *field* is secret, not the table or the count.
+- **(Found via live play, not `/ia probe` — probe no longer exists.)
+  `C_Spell.GetSpellCooldown(spellID)`'s returned `duration` (and presumably
+  `startTime`) are secret too, even for a PLAIN, non-secret `spellID` and even
+  for the player's own spell** — comparing `cd.duration > 0` errored "a secret
+  number value, while execution tainted by 'ImportantAuras'" (Bug #6). Contrast
+  `GetSpellBaseCooldown(spellID)` (the static/constant cooldown, same for
+  everyone): its result is plain — arithmetic (`ms/1000`) on it never errors.
+  So "the spell's fixed cooldown length" is public but "is this spell live
+  cooling down right now, and for how long" is secret — same shape as the
+  aura-spellId restriction, extended to live cooldown state. Practical
+  consequence: an addon cannot read a spell's real-time cooldown remaining
+  for ANY unit, including the player's own — `ResolveCastCooldown` now always
+  uses the static base cooldown (see Next Features #14).
+
+**General principle (apply proactively, don't wait to rediscover this per
+API):** **any information derived from an aura is secret while in combat**
+— not just the spellId (see above): duration, expirationTime, and by the
+same logic any other field read off `UnitAura`/`GetAuraDataByIndex` should
+be assumed secret-shaped too. And **any API call that takes a secret as an
+argument should be assumed to hand back a secret as well** — taint
+propagates through the call rather than being filtered out (`SetValue(secret)`
+→ `GetValue()` still secret is the clean example above; the
+`GetSpellCooldown` case shows the same taint can follow the surrounding
+*execution context* even when the specific argument passed is plain). Don't
+assume a getter "launders" a secret into something readable — none tried so
+far have (see "Approaches ruled out": `GetTextureFileID` didn't launder
+either). Treat any new API touching aura/cast/combat state as secret until
+proven otherwise (`issecretvalue()`/`type()` checks are safe; comparisons,
+arithmetic, and string formatting are not) rather than wiring it into a
+branch and finding out live.
 
 ## Approaches ruled out
 - **`hooksecurefunc` on `SetValue` with `if value >= max then Hide()`** — dead.
@@ -295,18 +325,27 @@ then brought into this same pass once `LibNameplateRegistry-1.0` was vendored.
 ### Data model — AceDB, replaces the flat `ImportantAurasDB`
 `profile.stacks[stackID] = { kind, ... }`, `stackID` a stable string key (not
 an array index) so stacks survive reorder/delete cleanly.
-- `kind = "unit"` (fixed frame): `unit` (player/target/focus/pet/partyN/
-  arenaN/bossN), `filter` (HARMFUL/HELPFUL), `targets`/`order` (unchanged
+- `kind = "unit"` (fixed frame): `units` (ORDERED array of tokens drawn from
+  `ID.UNIT_TOKEN_ORDER` in Config.lua — player/target/focus/pet/party1-4/
+  arena1-3/arenapet1-3/boss1-5; the stack fans out to ONE DISPLAY INSTANCE
+  PER TOKEN — Next Features #12, replaced the old single `unit` field
+  2026-07-05, per-stack migration in InitDB. Note: WoW has no "party5" token
+  — a full 5-player group is player + party1-4 — and modern arenas cap at 3
+  enemies), `group` (free-text label, Next Features #5: stacks sharing one
+  nest under a tree node in the GUI and export/import as a set; "" = none),
+  `filter` (HARMFUL/HELPFUL/CAST), `targets`/`order` (unchanged
   priority-list semantics), `layout`, `iconSize`, `spacing`, `bg`, `panel`,
   `panelPad`, `locked`, `anchor = { useFrame, myPoint, relPoint, x, y, point
-  (free-float fallback) }`. `useFrame=true` resolves via LibGetFrame and
-  falls back to the legacy free-float drag-anywhere point if resolution
-  fails; dragging while frame-attached adjusts the saved `x,y` offset instead
-  of an absolute `UIParent` point.
-- `kind = "nameplate"`: same targets/order/filter/layout/iconSize/spacing, no
-  `unit` field — always follows the current target's nameplate (see Runtime
-  section below) — and `anchor = { myPoint, relPoint, x, y }` only (a plate
-  IS the anchor — no free-float fallback, no lock/drag).
+  (free-float fallback) }`. `useFrame=true` resolves via LibGetFrame
+  PER-INSTANCE (each instance follows its own unit's frame) and falls back
+  to the free-float point if resolution fails; free-floating instances of a
+  multi-unit stack share the one saved point, offset vertically by instance
+  index into a column, and only instance 1 is draggable (its drag-stop
+  calls `FrameAnchor.RepositionAll()` so siblings resettle immediately).
+- `kind = "nameplate"`: same targets/order/filter/layout/iconSize/spacing/
+  group, no `units` used — always follows the current target's nameplate
+  (see Runtime section below) — and `anchor = { myPoint, relPoint, x, y }`
+  only (a plate IS the anchor — no free-float fallback, no lock/drag).
 - **Migration**: on load, if `ImportantAurasDB` is in the old flat shape
   (`.targets` at the top level, no `.profiles`), stash it before `AceDB:New`,
   then seed exactly one `kind="unit"`, `unit="player"`, `useFrame=false` stack
@@ -324,10 +363,14 @@ only. Split:
   stacks (matchers are generic, keyed only by icon+geometry, not by unit) —
   slots stay per-instance (aura index is per-unit-scan).
 - **`StackManager.lua`**: reads `profile.stacks` where `kind="unit"`,
-  creates/destroys `Stack` instances 1:1, each owning a `CreateFrame` that
-  self-registers `UNIT_AURA` for its own unit token (today's single-event-frame
-  pattern, just N of them). Anchoring for these goes through `FrameAnchor.lua`
-  (the `LibGetFrame` wrapper described above).
+  creates/destroys `Stack` instances — since Next Features #12 (2026-07-05)
+  no longer 1:1 but ONE PER TOKEN in `sdb.units`, each instance owning a
+  `CreateFrame` that self-registers `UNIT_AURA` (or the global
+  `UNIT_SPELLCAST_SUCCEEDED` + Lua token compare, for CAST) for its own
+  unit token, with `stack.unitToken`/`stack.freeIndex` stamped on the
+  instance. `live[id] = { sig, instances }` where `sig` is
+  `concat(units)|filter` — any edit to either tears the whole entry down.
+  Anchoring goes through `FrameAnchor.lua` (the `LibGetFrame` wrapper).
 - **`NameplateStackManager.lua`**: `kind="nameplate"` configs always follow
   the player's current target (see the library-removal note above) — at most
   one live `Stack` instance per stack id, no fan-out. Resolves the target's
@@ -395,13 +438,32 @@ Worth remembering if any future default-seeded content is added.
 - `SpellSearchBox.lua` — custom AceGUI widget (`"IA-SpellSearchBox"`) giving
   the "Add spell" box a live-as-you-type results dropdown, styled after
   TellMeWhen_Options's Suggester (Next Features #8.1 addendum).
-- `Data/SpellDB.lua` — static, offline-generated `{id, name}` table of every
-  class/spec/hero-talent/pvp-talent spell (Next Features #13); ships empty
-  until `Tools/generate_spelldb.js` is run against real credentials.
+- `Data/SpellDB.lua` — static, offline-generated `{id, name}` table (Next
+  Features #13). **Regenerated 2026-07-05 from simc data: 31,044 spells**
+  (1.5MB, client build 12.0.7.68275, simc `midnight` branch) — baseline
+  abilities, talents, PvP talents, and separately-id'd aura spells all
+  covered; see the simc-rewrite bullet under Next Features #13 for the
+  source switch and remaining edge cases.
 - `Tools/generate_spelldb.js` — offline Node script that regenerates
-  `Data/SpellDB.lua` from Blizzard's Battle.net Game Data API. Not run by the
-  game or by Claude — the addon itself can't make network calls, so this is a
-  manual, user-run step (see Next Features #13 for invocation).
+  `Data/SpellDB.lua`. Not run by the game — the addon can't make network
+  calls, so this is a manual step: `node Tools/generate_spelldb.js` (no
+  credentials; `--branch <simc-branch>` to match another expansion,
+  `--file <allspells.txt>` for fully-offline runs). **Rewritten 2026-07-05**
+  to parse SimulationCraft's `SpellDataDump/allspells.txt` (client-extracted
+  DB2 spell data, regenerated per build, fetched from GitHub) instead of
+  walking the Battle.net Game Data API — ~31k spells vs ~3k, now covering
+  baseline abilities and PvP talents the API walk structurally missed; an
+  `EXTRA_SPELLS` list in the script hand-patches known simc-whitelist gaps
+  (Polymorph 118 etc.).
+- `Transfer.lua` — import/export (Next Features #4/#5): a Lua-literal-subset
+  serializer + a no-loadstring recursive-descent parser ("IA1:" prefix), a
+  whitelist/clamp sanitizer every imported stack is rebuilt through, and the
+  copy/paste dialog frame. Round-trip + hostile-input tested offline under
+  lua5.1 (see Possible next steps).
+- `Presets.lua` — one-click presets (Next Features #6): data-driven
+  `ID.Presets` list consumed by the Options "Presets" page; ships Arena Kick
+  Tracker (CAST stack over arena1-3+arenapet1-3) and Party Kick Tracker
+  (player+party1-4), both built on the multi-unit fan-out.
 - `Options.lua` — AceConfig/AceGUI options UI + slash entry point.
 - `Core.lua` — bootstrap glue only (`ADDON_LOADED`/`PLAYER_LOGIN` handler); the
   diagnostic mask demos it used to hold were removed 2026-07-05.
@@ -419,15 +481,38 @@ production-verified and stable; the per-stack "locked" checkbox in the GUI
 global slash shortcut is gone.
 
 ## Possible next steps
-- **Run `Tools/generate_spelldb.js` and verify the broadened spell search
-  (Next Features #13, nothing below has been tested/run yet)**:
-  1. Create a free Battle.net API client at develop.battle.net/access/clients,
-     then run `BNET_CLIENT_ID=... BNET_CLIENT_SECRET=... node
-     Tools/generate_spelldb.js` from the addon folder.
-  2. Check the printed summary count — if it's 0 or suspiciously low, re-run
-     with `--dump` on the console output for one class and compare the real
-     JSON shape against `walkForSpells()`'s assumption in the script
-     (`{spell:{id,name}}` sub-objects anywhere in the response).
+- **In-game verification of the 2026-07-05 feature pass (#4/#5/#6/#9/#12 +
+  Bug #3 hardening — all luac5.1-clean and, for Transfer.lua's
+  serializer/parser/sanitizer, offline-tested 18/18 under real lua5.1, but
+  none of it loaded in the client yet)**:
+  1. `/reload`, confirm no errors; existing stacks migrate `unit` →
+     `units={unit}` silently (icons show exactly where they did before).
+  2. Multi-unit (#12): on a stack, check Player + Party1 toggles; confirm
+     one icon column free-floating (only the top instance draggable, drag
+     moves the column) and per-unit frames when "Attach to unit frame" is
+     on. Confirm arena pet toggles exist.
+  3. Preview (#9): click Preview on a stack with tracked spells; top-
+     priority icon flashes ~3s on every instance, then normal scanning
+     resumes (no stuck icon; no flash on a nameplate stack with no target).
+  4. Groups (#5): set the same Group name on two stacks, confirm they nest
+     under a tree node; Export group → dialog with selectable string.
+  5. Import/Export (#4): export a stack, `/ia reset`, import the string,
+     confirm it comes back intact (targets, order, units, anchor). Try
+     pasting garbage → red-error-free "import failed" chat message.
+  6. Presets (#6): open Presets page, create the Party Kick Tracker; in a
+     party (or solo — the player toggle alone suffices), have someone (or
+     yourself) interrupt: icon flashes on the caster's frame for ~4s.
+  7. Bug #3: with "Attach to unit frame" on, confirm no blue drag-hint
+     square appears at any point after `/reload`, even before unit frames
+     resolve.
+- **Verify the simc-based SpellDB in-game** (generator rewritten + run
+  2026-07-05: 31,044 spells from simc's `midnight` allspells.txt): `/reload`,
+  confirm no errors loading the now-1.5MB `Data/SpellDB.lua`; search "Kick"
+  and "Polymorph" (baseline, previously impossible) and "Precognition" (PvP
+  talent) on a class that doesn't know them; watch for typing lag in the
+  search box — the linear scan in `SpellSearch.Search` is now over ~31k
+  entries per (debounced) keystroke, expected fine but unmeasured.
+- **Verify the broadened spell search in-game (Next Features #13)**:
   3. `/reload`, confirm no Lua errors loading the regenerated `Data/SpellDB.lua`.
   4. In a stack's "Add spell" box, search for a spell from a class/spec you
      don't play (e.g. "Kingsbane" as a non-Rogue) and confirm it now appears.
@@ -460,19 +545,25 @@ global slash shortcut is gone.
      errors from feeding a cast's spellID (may be secret) into the matcher.
 - Verify secrets through the dual punch (`/ia demomask3 secret 1` +
   `secret 99999999`) and the live display with real tracked buffs.
-- **In-game verification of the cooldown swipe (Next Features #7, nothing
-  below has been tested live yet)**:
-  1. `/reload`, confirm no Lua errors; existing stacks show the new "Cooldown
-     swipe" toggle (default on) under Display.
-  2. With a stack tracking a real buff/debuff, confirm the swipe animates
-     over the icon while it's up, and is absent (no leaked pie/edge) for
-     slots holding auras that aren't tracked targets.
-  3. Toggle "Cooldown swipe" off/on, confirm it hides/shows without errors.
-  4. Watch chat for the red "cooldown swipe disabled" warning -- if it
-     prints, `SetCooldown` rejected a secret timing value; report back so
-     the approach for that case can be revisited.
-  5. Confirm CAST-mode stacks never show the toggle and never error (no
-     duration data in that path).
+- **In-game verification of the cooldown DRAIN (Next Features #16 — the
+  DurationObject rework that replaced the #7/#14 swipe; nothing below has
+  been tested live yet)**:
+  1. `/reload`, confirm no Lua errors and NO red warning prints ("cooldown
+     display unavailable" = DurationObject API missing; "cooldown drain
+     disabled" = SetTimerDuration rejected a value — report either).
+  2. Aura stack tracking a real buff/debuff: confirm a dark vertical drain
+     over the matched icon that empties as the aura runs out, updates
+     correctly on aura refresh, and shows NOTHING over untracked auras'
+     (transparent) slots — the leak check.
+  3. If the bar renders statically full or empty instead of animating,
+     suspect the SetTimerDuration min/max assumption (bar is 0..1) and
+     report what it looks like.
+  4. A PERMANENT tracked buff (no expiration) should show a clean icon with
+     no dark overlay (DoesAuraHaveExpirationTime skip).
+  5. CAST stack (own Kick): icon + drain for the kick's base cooldown, no
+     Lua error, drain hidden again after the hide timer collapses the slot.
+  6. Toggle "Cooldown drain" off/on, confirm hide/show without errors, in
+     both aura and CAST stacks.
 - **In-game verification of the spell table + search (Next Features #8/#8.1,
   nothing below has been tested live yet)**:
   1. `/reload`, confirm no Lua errors; open a stack, confirm existing tracked
@@ -567,9 +658,47 @@ global slash shortcut is gone.
    sdb.anchor.useFrame` (previously only hid for `kind == "nameplate"`) — the
    checkbox now only shows for a free-floating unit stack, since
    frame/plate-attached stacks have no draggable position to lock.
-4. Import/Export stack feature
-5. Stack groups -> This would let you group like stacks together. For example, if I wanted to recreate OmniBar's kick tracker, I would put all of the different kicks into a single group. This would also allow exporting and importing of a group.
-6. A page to load presets. This would allow me to say add a button to create an arena kick tracker, or a M+ allied kick tracker.
+4. **IMPLEMENTED (2026-07-05, awaiting in-game verification).** Import/Export
+   stack feature — new file `Transfer.lua`. Export: "Export stack" button per
+   stack (and "Export group" on each group node) opens a dialog with a
+   selectable `"IA1:"`-prefixed string (auto-highlighted for Ctrl+C). Import:
+   "Import" button at the options root opens the same dialog in paste mode.
+   Format is a Lua-table-literal SUBSET serialized by hand and parsed by a
+   small recursive-descent parser — **never loadstring'd** (untrusted input);
+   every imported stack is rebuilt field-by-field onto `ID.NewDefaultStack()`
+   by `SanitizeStack` (whitelisted keys, type checks, numeric clamps, unit
+   tokens/anchor points restricted to known sets, free-float anchor forced
+   relative to UIParent, order/targets reconciled+deduped). Serializer,
+   parser, sanitizer, and group round-trip all covered by an offline lua5.1
+   test (escape-heavy names, floats, injection attempt, 50-deep nesting bomb
+   → depth-capped, malformed-field clamping) — 18/18 passed; only the dialog
+   frame itself needs in-game eyes. `SanitizeStack` is also run on EXPORT so
+   shared strings carry exactly the schema, no junk keys.
+5. **IMPLEMENTED (2026-07-05, awaiting in-game verification).** Stack groups
+   — new per-stack `group` string (input field next to Name; empty = none).
+   `BuildOptions` sorts stack ids numerically then hangs stacks with a group
+   under a `group_<name>` tree node (childGroups="tree", so stacks appear as
+   its children) carrying an "Export group" button;
+   `Transfer.ExportGroup(name)` serializes every member as
+   `{type="group",group=name,stacks={...}}` and import re-creates all of
+   them with the group name applied. Editing the Group field calls
+   `Options.Rebuild()` (tree topology change, same reason as rename).
+6. **IMPLEMENTED (2026-07-05, awaiting in-game verification).** Presets page
+   — new file `Presets.lua` defines `ID.Presets` (name/desc/create per
+   entry); Options root gained a "Presets" tree node with a description +
+   Create button per preset. Ships two: **Arena Kick Tracker** (one CAST
+   stack, units arena1-3 + arenapet1-3 — pets covered for Spell Lock/Axe
+   Toss — group "Arena Kicks", frame-attached RIGHT→LEFT of each arena
+   frame) and **Party Kick Tracker (M+)** (player+party1-4, group "Party
+   Kicks"), both tracking every class interrupt by its well-known CAST id
+   (`INTERRUPT_IDS` in Presets.lua: Pummel 6552, Rebuke 96231, Counter Shot
+   147362, Muzzle 187707, Kick 1766, Silence 15487, Mind Freeze 47528, Wind
+   Shear 57994, Counterspell 2139, Spell Lock 19647, Axe Toss 89766, Spell
+   Lock-sacrifice 132409, Spear Hand Strike 116705, Skull Bash 106839, Solar
+   Beam 78675, Disrupt 183752, Quell 351338 — CAST ids are exactly right
+   here since UNIT_SPELLCAST_SUCCEEDED payloads carry the cast id),
+   castDuration 4s ≈ lockout. Presets just create normal stacks; users
+   tweak/delete them like any other.
 7. **Cooldown swipe IMPLEMENTED (2026-07-05, awaiting in-game verification),
    text/stack count deferred.** The swipe is a `Texture`
    (`Cooldown:GetSwipeTexture()`), so it reuses the exact same `m.pLo`/`m.pHi`
@@ -718,7 +847,18 @@ global slash shortcut is gone.
      client build, `Search()` just returns no results (fails closed, same
      pattern as the cooldown-swipe latch) rather than erroring the options
      panel.
-9. A preview button, or perhaps just always showing the highest prio spellId icon in edit mode.
+9. **IMPLEMENTED (2026-07-05, awaiting in-game verification)** as a button,
+   not an always-on edit mode. "Preview" execute per stack (next to
+   Group) → `ID.PreviewStack(id)` → `Stack:Preview()` on every live
+   instance via both managers' new `ForStack(id, fn)`. Preview feeds the
+   top-priority tracked id into slot 1 — the fed value is the tracked id
+   itself, a PLAIN int the user typed, so the dual punch trivially matches
+   (`value == X`) with no secret anywhere in the path — shows `Layout(1)`
+   for 3s, then `Rebuild()` restores reality. A `self.previewing` flag makes
+   `Scan()` early-return so a UNIT_AURA firing mid-preview can't stomp it;
+   a token guards stacked previews the same way `OnCast` timers do. For a
+   nameplate stack with no current target plate there's no live instance, so
+   the button silently does nothing (nothing exists to show the icon on).
 10. **IMPLEMENTED (2026-07-05, awaiting in-game verification).** Removed
     `probe`, all `demo*`/`sweep` prototype functions (`Core.lua`), and `/ia
     lock`/`unlock` (`Config.lua`). The per-stack `locked` checkbox in the GUI
@@ -733,11 +873,26 @@ global slash shortcut is gone.
     `ID.Options.Rebuild()` so the GUI and live display both reflect the reset
     immediately.
 
-  8.1.Addendum -> I want it implemented like "TellMeWhen_Options" (copy available in ~/Downloads)
+12. **IMPLEMENTED (2026-07-05, awaiting in-game verification).** Multi-frame
+    targeting for a single stack (e.g. Kingsbane on player+party1+party2 in
+    arena). Schema: `unit` → ordered `units` array (see the Data model
+    section; migrated per-stack in InitDB). `StackManager` fans a config out
+    to one Stack instance + event frame per token (see the Runtime section).
+    GUI: the Unit dropdown was replaced by ONE TOGGLE PER TOKEN in canonical
+    order (an AceConfig multiselect renders its values in `pairs()` order,
+    i.e. randomly — individual toggles with explicit `order` keep the grid
+    stable), with token list per the request: arena1-3 and arenapet1-3 added;
+    **party1-4, not party1-5** — WoW has no "party5" token (a 5-player group
+    is player + party1-4); arena4/arena5 dropped from the picker to match
+    modern 3-cap arenas (an old saved stack with arena4 keeps working — the
+    migration/manager don't validate tokens, only the GUI toggles and the
+    import sanitizer restrict to `ID.UNIT_TOKEN_ORDER`). Frame-attach
+    resolves per-instance; free-float instances form a column under the one
+    saved point with only instance 1 draggable.
 
-12. I want the ability added back in where I can target multiple frames with a single stack. For example, if I make a stack with kingsbane, I want to be able to target player,party1,party2 so I can see in arena who has kingsbane. Also, the unit dropdown should have arena1-3 and party1-5 and arenapet1-3
-
-13. **IMPLEMENTED (2026-07-05), generator not yet run, in-game unverified.**
+13. **IMPLEMENTED (2026-07-05); generator later rewritten to simc data and
+    run for real the same day (31,044 spells — see final bullet); in-game
+    unverified.**
     "Add spell" search broadened beyond the player's own spellbook, plus
     live buff/debuff filtering, addressing the gap where e.g. searching
     "Kingsbane" found nothing on a non-Rogue.
@@ -780,13 +935,229 @@ global slash shortcut is gone.
       change) — into `SpellSearchBox.lua`'s `SetCustomData`/`OnQueryChanged`.
       A bare numeric spell id typed directly is **not** filtered (an explicit
       typed id is a deliberate action, not an ambiguous name match).
-    - **Not done this pass**: nobody has run `generate_spelldb.js` against
-      real credentials yet (needs the user's own Battle.net app), so the
-      recursive-walk schema guess is unverified against real API responses —
-      if a real run comes back with far fewer spells than expected, re-run
-      with `--dump` on one class and adjust `walkForSpells()` to match the
-      actual JSON shape. In-game verification of the broadened search UX and
-      the harmful/helpful filtering also hasn't happened.
+    - **GENERATOR HAS NOW BEEN RUN (2026-07-05): 3,158 spells in
+      `Data/SpellDB.lua`.** The recursive-walk hedge worked. Coverage audit
+      of the real output (sanity-check session, same day):
+      - **Talent spells: covered.** Kingsbane (385627), Hex, Mass Polymorph,
+        talent-based interrupts (Mind Freeze/Wind Shear/Rebuke/Skull Bash/
+        Spear Hand Strike/Counter Shot/Muzzle/Solar Beam/Quell) all present.
+      - **Baseline (non-talent) class abilities: NOT covered** — Kick 1766,
+        Pummel 6552, Counterspell 2139, Silence 15487, Disrupt 183752,
+        Polymorph 118, Fear 5782 were all absent. No Game Data endpoint lists
+        a class's baseline spells. **Gap CLOSED by the simc rewrite (final
+        bullet)** — all of these are now in SpellDB.
+      - **PvP talents: NOT covered by the original walk** (no Precognition/
+        Thoughtsteal in the output — they are NOT inlined in the
+        playable-specialization or talent-tree responses after all). The
+        generator was extended same-day to walk `pvp-talent/index` →
+        `pvp-talent/{id}`, but that walk was never re-run — **moot after the
+        simc rewrite (final bullet)**, whose corpus includes PvP talents.
+      - **THE KINGSBANE ID TRAP — DEBUNKED (same day, via simc effect
+        data).** The original audit believed the debuff Kingsbane applies
+        was **192853**, a different id from the cast (385627), with no
+        harvestable source mapping cast→aura. simc's per-effect dump
+        (extracted from the client's own SpellEffect.db2) settles it:
+        385627's effect #4 is `Apply Aura | Periodic Damage: nature every 2
+        seconds, Target: Targeted Enemy` — **the debuff IS 385627, same id
+        as the cast**. 192853 is a dead Legion-era leftover (still named
+        "Kingsbane" in the client's 413k-row SpellName table, hence the
+        confusion; Wowhead's 192759 likewise). General rules learned from
+        the same data: (a) a cast whose own effect list has `Apply Aura`
+        applies that aura under ITS OWN id — the common case; (b) where a
+        cast triggers a separately-id'd spell, the link is
+        `SpellEffect.db2`'s EffectTriggerSpell (7,679 `Trigger Spell:`
+        lines in allspells.txt) and the triggered spell usually shares the
+        cast's name, so BOTH ids surface in name search; (c) only
+        server-side dummy-script auras are unmappable from ANY data source
+        (not simc, not Wowhead, not the client files) — for those the
+        addon-as-probe trick ("add all candidate ids, get the aura applied
+        once, remove the ones that stay dark") remains the only way, since
+        aura spellIds are secret in-game and can't be dumped. The Options
+        note under the spell list was rewritten accordingly (rare-case
+        wording, Kingsbane example removed).
+      - Also fixed this pass: `SpellSearch.BuildCache()`'s pet-bank scan was
+        iterating the PLAYER's skill-line index ranges against the Pet bank
+        (mostly out-of-range reads); pet spells are indexed
+        `1..HasPetSpells()` directly, now scanned that way.
+      In-game verification of the broadened search UX and harmful/helpful
+      filtering still hasn't happened.
+    - **GENERATOR REWRITTEN + RE-RUN (2026-07-05, later the same day):
+      source switched from the Battle.net API walk to SimulationCraft's
+      `SpellDataDump/allspells.txt`** — a plain-text dump of the spell data
+      simc extracts from the game client's own DB2 files, regenerated per
+      build by the simc team and fetched with one HTTPS GET from GitHub (no
+      API keys; the old Battle.net OAuth flow is gone — see git history for
+      that version). The `midnight` branch matches the 12.x client
+      (`--branch thewarwithin` etc. for older ones). Result: **31,044
+      spells**
+      in `Data/SpellDB.lua` (1.5MB, luac5.1-clean, source build
+      12.0.7.68275) vs the API walk's 3,158 — baseline abilities
+      (Kick/Pummel/Counterspell/Silence/Disrupt/Fear/Sap/Blind/...), PvP
+      talents (Precognition 377360 AND its separately-id'd 4s aura 377362),
+      and hidden/separately-id'd aura spells all present ([Hidden]/[Passive]
+      dump entries deliberately kept — aura spells are often flagged
+      hidden). simc's corpus is a combat-sim whitelist, not the client's
+      full ~413k-row SpellName table (deliberately NOT used as the source:
+      overwhelmingly internal junk that would flood name search, and
+      id→name display already resolves live via `C_Spell.GetSpellInfo`);
+      whitelist gaps found by spot-checking ~50 common trackable spells are
+      hand-patched via `EXTRA_SPELLS` in the script — Polymorph 118,
+      Repentance 20066, Mesmerize 115268, Spell Lock-sacrifice 132409 were
+      the only misses. For future needs beyond names: wago.tools serves the
+      raw client DB2 tables as CSV (`https://wago.tools/db2/SpellName/csv`,
+      `.../SpellEffect/csv` incl. EffectTriggerSpell for cast→aura links).
+      In-game verification pending (see Possible next steps).
+  14. **IMPLEMENTED (2026-07-05, awaiting in-game verification).** CAST-mode
+    icons now show for the cast spell's COOLDOWN with a cooldown swipe,
+    instead of a fixed `castDuration` flash. The secret-safety trick: the
+    cast payload spellID may be secret, so we never look up ITS cooldown —
+    but each matcher owns one PLAIN tracked id (`m.targetID`, stamped in
+    `SetMatcherTarget`), so `Stack:OnCast` gives EVERY matcher its own
+    spell's cooldown swipe and its own plain `C_Timer` hide; for the one
+    visible (matched, decided in C by the dual punch) matcher those are
+    exactly right, and for the transparent misses they're invisible no-ops.
+    Cooldown source (`Stack:ResolveCastCooldown(id)`, all pcall-guarded):
+    **originally** `C_Spell.GetSpellCooldown` (as requested) ONLY when the
+    instance's `unitToken == "player"` — it reflects the player's OWN live
+    cooldown state (already ticking, includes talent CDR), which is
+    meaningless or actively wrong for another unit's cast (e.g. an enemy
+    rogue's Kick would read the player's Kick CD) — otherwise the static base
+    cooldown via `GetSpellBaseCooldown(id)` (global API, resolves ANY spell
+    id, learned or not; enemy talent CDR invisible to us, acceptable).
+    **REVERTED (2026-07-06, Bug #6)**: `C_Spell.GetSpellCooldown`'s `duration`
+    field turned out to be secret even for the player's own spell — see the
+    new "Verified in-game" bullet — so `ResolveCastCooldown` now ALWAYS uses
+    the static base cooldown, for every unit including the player (talent CDR
+    invisible to us across the board, not just for other units). If the spell
+    has no base cooldown at all (e.g. tracking a no-CD cast), falls back to
+    the old `db.castDuration` flash (that field is now fallback-only; it has
+    no GUI option). Supporting changes: per-matcher `castHideToken` invalidated
+    on `ReleaseMatcher` (a pooled matcher reacquired elsewhere can't be hidden
+    by a stale timer) and on every `FeedSlot` feed (a fresh feed/Preview
+    supersedes a pending cast-expiry hide; `FeedSlot` also re-`Show()`s
+    matchers for the CAST-stack Preview path); slot-level `castToken` backstop
+    `Layout(0)` now fires after the LONGEST per-matcher remaining time. The
+    "Cooldown swipe" toggle (`showCooldown`) is no longer hidden for CAST
+    stacks and gates the swipe there too; the kick presets' `castDuration=4`
+    kept as fallback. In-game checks: party/arena kick cast → icon with swipe
+    for the kick's real CD (own casts: exact incl. CDR; others: base CD);
+    two casts of different-CD tracked spells in a row → second cast replaces
+    the first, each hides on its own schedule; a no-CD tracked cast still
+    flashes ~castDuration; toggle off → icon shows for the CD but no swipe;
+    watch for the red "cooldown swipe disabled" print (SetCooldown rejected
+    values).
+
+15. **IMPLEMENTED (2026-07-06, awaiting in-game verification).** CAST-mode's
+    per-matcher/per-slot timers (Next Features #14) are sized off the round's
+    cooldown state, so they go stale across a zone change or a new arena
+    round (opponents/cooldowns reset, but a pending `C_Timer.After` from the
+    old round would still fire and hide/collapse based on the old timing).
+    `Core.lua`'s bootstrap frame now also listens for `PLAYER_ENTERING_WORLD`,
+    `ZONE_CHANGED_NEW_AREA`, and `UNIT_SPELLCAST_SUCCEEDED` filtered to
+    `unit=="player"` and `spellID==228212` ("Arena Starting Area Marker" —
+    the round-start marker, ported from **ArenaTalentReminder**, a sibling
+    addon by the same author; it's a spell CAST the player auto-casts at the
+    start of every round including Solo Shuffle, not a buff/aura, despite
+    that being the original assumption). All three call the existing
+    `ID.RefreshAll()` (`Options.lua:53`, already used by every options-GUI
+    edit), which `Rebuild()`s every live stack instance — `BuildSlotBars`
+    releases every matcher (bumping `castHideToken`, so any pending cast-hide
+    or backstop timer referencing the old matcher becomes a no-op) and either
+    `Layout(0)`s (CAST stacks, nothing to rescan) or re-`Scan()`s (aura
+    stacks). No new cleanup method was needed — this reuses the same
+    Rebuild path config edits already exercise. In-game checks: mid-swipe on
+    a CAST stack, zone out of the arena (or wait for a new Solo Shuffle
+    round) and confirm the icon clears immediately with no stale swipe
+    surviving into the new zone/round, and no Lua errors from the new event
+    registrations.
+
+16. **IMPLEMENTED (2026-07-06, awaiting in-game verification): cooldown
+    display reworked from the radial Cooldown widget to a masked StatusBar
+    "drain", via 12.0's DurationObject API.** This replaces Next Features
+    #7/#14's swipe rendering wholesale and closes Bug #6's still-open
+    follow-up. Two independent reasons the swipe could never render:
+    - **`Cooldown:GetSwipeTexture` does not exist** (confirmed on
+      warcraft.wiki: not in the Cooldown widget method list, its API page
+      404s). The swipe is internal to the widget, not a retrievable Texture,
+      so `m.cdMaskable` was ALWAYS false on every client and `m.cd` stayed
+      permanently hidden (fail-closed) — that's exactly what Bug #6's
+      "couldn't mask the swipe texture" print was reporting. No masking
+      means no way to hide a miss-matcher's swipe, so the widget is
+      unusable for this addon, period.
+    - **The aura path computed `expirationTime - duration` in Lua** —
+      arithmetic on secrets, which always errored in combat; the pcall
+      turned that into a permanent `cdBroken` latch instead of a swipe.
+      Also moot since 12.0.1: `SetCooldown`/`SetCooldownFromExpirationTime`/
+      `SetCooldownDuration`/`SetCooldownUNIX` no longer accept secrets from
+      tainted code at all — `SetCooldownFromDurationObject` is the only
+      sanctioned secret path into a Cooldown widget.
+    **The sanctioned 12.0 machinery (researched on warcraft.wiki
+    2026-07-06):** DurationObjects (`C_DurationUtil.CreateDuration()`,
+    setters `SetTimeFromStart(startTime, duration[, modRate])`/
+    `SetTimeFromEnd(endTime, duration[, modRate])`/`SetTimeSpan(start,
+    end)`) carry possibly-secret timings from C to C without Lua reading
+    them; `C_UnitAuras.GetAuraDuration(unit, auraInstanceID)` builds one
+    for an aura from PLAIN args; `StatusBar:SetTimerDuration(durObj,
+    interpolation, direction)` (Enum.StatusBarInterpolation.Immediate=0,
+    Enum.StatusBarTimerDirection.RemainingTime=1) animates a bar fill from
+    one entirely in C. A StatusBar fill texture is a texture WE own — so it
+    takes the dual-punch masks, unlike the swipe.
+    **New design (`Stack.lua`):** per-matcher `m.cdBar`, a VERTICAL
+    StatusBar `SetAllPoints`'d over the icon, fill = dark translucent
+    (0,0,0,0.6), min/max 0..1, direction RemainingTime (dark fill height =
+    remaining fraction, drains downward). Its fill texture carries its OWN
+    clones of both punch masks (`m.cdLo`/`m.cdHi` — not shared with the
+    icon's `m.pLo`/`m.pHi`, to avoid betting on cross-frame AddMaskTexture;
+    `m.cdLo` is re-anchored alongside `m.pLo` in `RefreshPunchLoAnchors`,
+    `m.cdHi` rides `bhi`'s fill like `m.pHi` does), so the drain is
+    transparent exactly when the icon is. Gated on `C_DurationUtil` +
+    `SetTimerDuration` existing (`m.cdOK`; one-time warning print if not).
+    Feeds: aura path — `Scan` calls `C_UnitAuras.GetAuraDuration(unit,
+    data.auraInstanceID)` (pcall'd) and passes the DurationObject to the
+    reshaped `FeedSlot(slot, secretSpellId, durObj)`; permanent auras are
+    skipped via `C_UnitAuras.DoesAuraHaveExpirationTime` (pcall'd +
+    `issecretvalue`-guarded, fails open) so a never-expiring buff doesn't
+    park a full dark bar on its icon. CAST path — `OnCast` sets the
+    matcher's own reusable `m.durObj:SetTimeFromStart(now, baseCD)` from
+    ResolveCastCooldown's PLAIN numbers (that function is unchanged — its
+    pcall'd GetSpellBaseCooldown + castDuration fallback semantics were
+    already correct) and hands it to the same bar, so both modes share one
+    display path; the plain hide-timer arithmetic in OnCast is untouched.
+    `Preview` passes nil durObj (no drain). The Cooldown widget, `m.cd`,
+    `cdMaskable`, and the `ID.cdMaskWarned` diagnostic are DELETED; the
+    `cdBroken` latch stays (now trips only if SetTimerDuration/
+    SetTimeFromStart themselves reject values). Options toggle renamed
+    "Cooldown drain" (same `showCooldown` field). Known cosmetic change:
+    it's a linear drain, not a radial swipe — a radial swipe is
+    structurally impossible to mask. **RADIAL CONSIDERED AND DECLINED
+    (2026-07-06, user decision).** Recap of why radial is off the table so it
+    doesn't resurface: the rotation swipe is the internal `Cooldown` widget,
+    whose swipe is not a retrievable/maskable Texture, so it can't be hidden
+    on the (secret) non-matching auras. For AURA stacks it's impossible — we
+    never know in Lua which auras match our tracked list (spellId secret), so
+    an unmaskable swipe would render on every aura's slot and leak "something
+    is here" on untracked buffs; `SetCooldownFromDurationObject` could DRIVE
+    it secret-safely, but driving was never the blocker, hiding-on-miss is.
+    For plain-payload CAST stacks it WOULD be technically doable (own casts
+    are plain post-Bug #7, so the exact matched matcher + its cooldown are
+    known in Lua — a normal `Cooldown` widget on just that one matcher, no
+    masking needed), but the user chose the uniform linear drain over a
+    CAST-radial / aura-linear split appearance. So: linear everywhere,
+    deliberately. The min/max assumption was RESOLVED
+    2026-07-06 by reading Blizzard's own code (Bug #7 follow-up, below):
+    `SetTimerDuration` puts the bar in a self-managed timer mode (min/max
+    irrelevant while attached), and calling `SetMinMaxValues` afterwards is
+    how Blizzard CANCELS timer mode / releases the duration object
+    (`EncounterTimelineTimerEvent.lua`'s `Reset` does `SetMinMaxValues(0,0)`
+    exactly for that) — so never touch the drain bar's min/max after feeding
+    it a timer. NEW RISK found in `SimpleStatusBarAPIDocumentation.lua`:
+    `SetTimerDuration` is marked `SecretArguments = "AllowedWhenUntainted"`
+    (contrast `SetValue`: `"AllowedWhenTainted"`), suggesting tainted addon
+    code may NOT pass a SECRET-carrying DurationObject — fine for the CAST
+    path (plain values), but the aura path's `GetAuraDuration` objects carry
+    secret timings and may be rejected → the `cdBroken` latch + "drain
+    disabled" print would fire on the first real aura scan. Watch for that
+    in-game; if it fires, the aura drain needs a different sanctioned path.
 
 ## Bugs
 1. **FIXED (2026-07-05).** Updating stack name in the stack edit screen
@@ -810,21 +1181,21 @@ global slash shortcut is gone.
    was collapsed to target-only (see the "REMOVED" library note and Next
    Features #1) — that only needs a plain Blizzard API
    (`C_NamePlate.GetNamePlateForUnit`), no library, no name comparisons.
-3. **Still open.** When attaching to unit frames, there is still a blue
-   square drag-hint anchor visible. It shouldn't be there for "Attached"
-   stacks. Static review of `FrameAnchor.lua` found `ApplyFrameAttach`
-   already calls `stack.anchor.moveHint:Hide()` whenever
-   `LGF.GetUnitFrame(...)` resolves a frame, with no apparent logic bug in
-   that path or in how/when `Reposition` is called. Leading theory (unverified,
-   couldn't reproduce from reading code alone): `LibGetFrame`'s internal frame
-   cache populates asynchronously off game events, so the very first
-   `Reposition()` call right after login/reload could see a nil frame before
-   the library's scan completes, and something in that self-heal path (the
-   `FRAME_UNIT_ADDED`/`GETFRAME_REFRESH` callbacks `FrameAnchor.lua` already
-   listens for) may not be firing/resolving as expected. Needs to actually be
-   reproduced live (does it clear after a few seconds? only for certain unit
-   tokens like party/arena vs. player? does re-toggling "Attach to unit
-   frame" fix it?) before attempting a fix.
+3. **HARDENED (2026-07-05, awaiting in-game verification).** When attaching
+   to unit frames, a blue square drag-hint anchor was still visible. Static
+   review had found no bug in the resolved-frame path; leading theory was
+   the FALLBACK path: `LibGetFrame`'s cache fills asynchronously after
+   login, so early `Reposition()` calls (and any unit whose frame never
+   resolves — empty party slot, unsupported frame addon) drop into
+   `ApplyFreeFloat`, which used to show the drag hint purely off
+   `db.locked`. Fixed by policy rather than by chasing the race:
+   `ApplyFreeFloat` now never shows the hint nor enables dragging while
+   `db.anchor.useFrame` is true — an "attached" stack positions at the
+   fallback point if it must, but it never presents as draggable (its
+   offset is GUI-set, so dragging it had no stable meaning anyway; this
+   matches the existing decision to hide the "Locked" toggle for attached
+   stacks, Next Features #3.1). If a blue square still appears after this,
+   the repro questions from the original report still apply.
 4. **FIXED (2026-07-05).** Two Lua errors seen together in-game: repeated
    (7x) `Options.lua:83: attempt to call a nil value` down through
    `BuildSpellListArgs`/`BuildStackArgs`/`BuildOptions`/`Init`, plus
@@ -839,4 +1210,96 @@ global slash shortcut is gone.
    `ID.SpellSearch.GetDisplay(spellID)`, hence one nil-call error per tracked
    spell (7 total across the user's stacks) on every `Init`/`Options.Open`.
    Fixed by wrapping each `RegisterEvent` call in `pcall` so one bad/removed
-   event name can't take down the rest of the file. 
+   event name can't take down the rest of the file.
+5. **FIXED (2026-07-06), first real in-game test of a `useFrame` unit stack.**
+   User reported a frame-attached stack (player, own Kick) not anchoring
+   correctly under **Ellesmere UI**. Root cause found by reading
+   `EllesmereUIUnitFrames.lua`: it builds its own `oUF` frames but spawns
+   them under fixed, addon-prefixed global names
+   (`EllesmereUIUnitFrames_Player`/`_Target`/`_Focus`/`_Pet`/`_TargetTarget`/
+   `_FocusTarget`/`_Boss<n>`), not the `oUF_<suffix><Unit>`-style names
+   `LibGetFrame-1.0`'s generic-oUF regexes match — not a stale-version
+   problem, just a naming convention LibGetFrame's author never saw. Fixed
+   in `FrameAnchor.lua` (not the vendored library, which is refreshed from
+   upstream and shouldn't carry local patches — see the Files section):
+   `GetEllesmereFrame(unit)`, a small table of the fixed names above, gated
+   on `C_AddOns.IsAddOnLoaded("EllesmereUIUnitFrames")` so it can't misfire
+   under any other UI, checked *before* `LGF.GetUnitFrame(unit)` in
+   `FrameAnchor.Reposition`. party/arena tokens aren't covered — Ellesmere's
+   own unit-frames module doesn't spawn those (its separate
+   `EllesmereUIRaidFrames` addon skins Blizzard's default `CompactParty`/
+   `CompactRaid` frames instead, which LibGetFrame already matches
+   natively) — untested but should already work. Arena enemy frames have no
+   LibGetFrame support at all (not Ellesmere-specific, a pre-existing gap);
+   those stacks fall back to free-float regardless of UI addon.
+6. **ROOT-CAUSED AND FIXED (2026-07-06).** User reported no cooldown swipe on
+   a CAST-mode stack tracking their own Kick (icon itself showed/hid
+   correctly). First pass added the diagnostic described below and the user's
+   next report was the new "cooldown swipe unavailable... couldn't mask the
+   swipe texture" message — but the REAL error, caught separately in the same
+   session, was a raw Lua error one call further down the stack:
+   `Stack.lua:342: attempt to compare field 'duration' (a secret number
+   value...)` in `ResolveCastCooldown`. Root cause: `C_Spell.GetSpellCooldown`
+   (only ever called for the player's own cast, per Next Features #14's
+   original design) returns a secret `duration` field — comparing
+   `cd.duration > 0` to decide whether the live data was usable is exactly
+   the forbidden secret-branch this addon has hit before for aura spellIds
+   (see "Verified in-game"), just newly discovered on cooldown state. That
+   error aborted `OnCast` before it ever reached `SetCooldown` — the masking
+   diagnostic below was a real-but-secondary symptom (the mask/texture setup
+   at matcher-creation time is unrelated and may still be worth revisiting,
+   but wasn't the actual blocker for a swipe ever appearing). Fixed by
+   dropping `C_Spell.GetSpellCooldown` entirely — `ResolveCastCooldown` now
+   always uses the static `GetSpellBaseCooldown` value, for every unit
+   including the player (see Next Features #14 and "Verified in-game" for the
+   full writeup). The masking diagnostics added during triage stay in place
+   (harmless, and useful if the swipe still doesn't render now that
+   `SetCooldown` will actually be reached): `Stack.lua`'s `AcquireMatcher`
+   pcall-guards `Cooldown:AddMaskTexture` alongside `GetSwipeTexture` and
+   prints a one-time red message (`ID.cdMaskWarned` latch) if either fails.
+   In-game check: cast Kick again, confirm the swipe now animates over the
+   real base-cooldown duration with no Lua error. If the masking diagnostic
+   fires instead, the swipe stays permanently hidden (fail-closed — `m.cd` is
+   `Hide()`'d at matcher-creation time and `OnCast` never un-hides it) even
+   though `SetCooldown` itself will now succeed — that's a separate,
+   still-open problem worth a follow-up.
+7. **FIXED (2026-07-06, awaiting in-game verification).** CAST-mode icon
+   appeared for a split second then vanished (user testing own Kick, no Lua
+   errors). Root cause: `Stack:OnCast` fed EVERY `UNIT_SPELLCAST_SUCCEEDED`
+   payload into slot 1's matchers — and that event fires for every successful
+   cast on the unit, including hidden proc/internal spells and whatever the
+   player presses on the next GCD. Each new cast overwrote the bars' values
+   and the dual punch (correctly) blanked the icon on the mismatch, so a
+   tracked cast's display only survived until the unit's next cast event. The
+   hide timers (#14) were never the problem. Fixed with a Lua-side guard at
+   the top of `OnCast`: when the payload spellID is PLAIN (checked via
+   `issecretvalue`; own-cast payloads are verified plain in-game — Core.lua's
+   `a3 == ROUND_START_SPELL` compare on this same payload never errored
+   during the user's kick testing), an id not found in `db.order` returns
+   early without touching the bars. A SECRET payload can't be compared, so it
+   falls through and feeds C exactly as before — meaning for units whose cast
+   payloads are secret, an untracked cast still blanks a live display
+   (StatusBars have no latch; no known C-side fix — same class of limitation
+   as the shelved name-matching in Next Features #1). In-game check: cast
+   Kick then keep attacking/casting — icon + drain should persist the full
+   base CD (~15s) through other casts and procs; a second cast of a
+   DIFFERENT tracked spell should still replace it.
+   **Follow-up (same day, VERIFIED-in-game the icon persists now): the drain
+   bar was still invisible.** Root cause: `m.cdBar.tex` was created with
+   `CreateTexture(nil, "ARTWORK")` but never given texture CONTENT —
+   `SetStatusBarColor` is only a vertex color multiplied over the texels,
+   and a file-less texture has no texels, so the fill rendered nothing (the
+   punch bars `blo`/`bhi` use the same pattern but are invisible BY DESIGN —
+   only their fill rects matter — which is why this never showed up before).
+   Fixed with `m.cdBar.tex:SetTexture("Interface\\Buttons\\WHITE8X8")` at
+   creation. Everything else checked out against Blizzard's own source
+   (Gethe/wow-ui-source mirror, researched same day): `SetTimeFromStart
+   (startTime, duration [, modRate=1])` signature confirmed
+   (`LuaDurationObjectAPI`; default clock "equivalent to GetTime()"), enum
+   fallbacks confirmed (Interpolation Immediate=0/ExponentialEaseOut=1;
+   Direction ElapsedTime=0/RemainingTime=1), and the min/max question
+   resolved — see the #16 update. In-game check: kick → icon + dark
+   vertical drain emptying downward over ~15s.
+
+   ## Outstanding Questions
+   For spells where a single text string matches multiple spells, is there some way to know which is the "right" one? I see 5 rushing wind kick for example. 
