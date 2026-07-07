@@ -82,6 +82,39 @@ reconciles `db.order` against `db.targets` (drop stale, append missing sorted).
   consequence: an addon cannot read a spell's real-time cooldown remaining
   for ANY unit, including the player's own — `ResolveCastCooldown` now always
   uses the static base cooldown (see Next Features #14).
+- **`COMBAT_LOG_EVENT_UNFILTERED` is not available in Midnight (12.x)** (user,
+  2026-07-07). The usual fallback for tracking enemy casts — `SPELL_CAST_SUCCESS`
+  off the combat log — is gone, so cast tracking must use the `UNIT_SPELLCAST_*`
+  events exclusively. Note `SUCCEEDED` only fires on *completion* (an
+  interrupted/cancelled cast fires `UNIT_SPELLCAST_INTERRUPTED`/`_STOP`, never
+  `SUCCEEDED`); `UNIT_SPELLCAST_SENT` fires only for units the client controls
+  (`player`/`pet`), not enemies.
+- **`print` and `string.format("%d"/"%s", secret)` are valid secret sinks —
+  even in combat** (verified 2026-07-07). They render/observe the value without
+  letting insecure Lua branch on it. Only `secret .. anything` concatenation and
+  arithmetic error. So debug lines CAN format a secret spellID/aura field
+  directly (via `...` as a `%d`/`%s` arg, not `..`); `ID.dprintf` does this and
+  wraps the whole format+print in `pcall` as a backstop.
+- **`UNIT_SPELLCAST_SUCCEEDED` DOES fire for arena enemies** (in-game
+  2026-07-07, `/ia debug` global stream). The event layer was never the
+  problem — an earlier "casts I never see" impression was purely a diagnostic
+  that filtered to `u==unit`. Its payload spellID is **secret for an enemy
+  player in combat** (plain for the player/pet/own-cast). **The nameplate
+  token does NOT launder it**: the same cast (matched by identical castGUID)
+  is secret under BOTH `arenaN` and `nameplateN` in combat — an earlier plain
+  `nameplateN` reading was a PRE-combat artifact (secrecy is combat-gated).
+  Arena *pet* casts (`arenapetN`, e.g. Felhunter Spell Lock) read **plain**,
+  though — only enemy *player* payloads are secret.
+- **The castGUID (`UNIT_SPELLCAST_*` arg 2) is secret in combat, and its
+  embedded spellID can't be recovered** (in-game 2026-07-07). The GUID string
+  (`Cast-3-…-<spellID>-…`) literally contains the spellID as plain text in its
+  6th dash field, but `issecretvalue(guid)` is true, and `string.match`/
+  `string.find`/`tonumber` all **reject secrets** (same class as `..`/
+  arithmetic — user-confirmed), so there is no Lua path from the secret GUID
+  to a plain, comparable spellID. A secret string still *prints* via `%s`, so
+  visible digits in a debug line prove nothing — only `issecretvalue` does.
+  Net: an enemy cast's spellID must be handled in C (dual punch); it cannot be
+  identified in Lua.
 
 **General principle (apply proactively, don't wait to rediscover this per
 API):** **any information derived from an aura is secret while in combat**
@@ -96,9 +129,10 @@ propagates through the call rather than being filtered out (`SetValue(secret)`
 assume a getter "launders" a secret into something readable — none tried so
 far have (see "Approaches ruled out": `GetTextureFileID` didn't launder
 either). Treat any new API touching aura/cast/combat state as secret until
-proven otherwise (`issecretvalue()`/`type()` checks are safe; comparisons,
-arithmetic, and string formatting are not) rather than wiring it into a
-branch and finding out live.
+proven otherwise (`issecretvalue()`/`type()` checks are safe, and so are
+`print`/`string.format` on a secret — see the string-op note below;
+comparisons, arithmetic, and `..` concatenation are not) rather than wiring
+it into a branch and finding out live.
 
 ## Approaches ruled out
 - **`hooksecurefunc` on `SetValue` with `if value >= max then Hide()`** — dead.
@@ -153,9 +187,14 @@ an UPPER bound too, and that is blocked by a hard constraint discovered here:
 
 - **You cannot do arithmetic on a secret.** Verified via `/ia demomask
   negsecret`: feeding `-value` (to invert a bar) errors — negation is a forbidden
-  op, same class as branching. `string.format("%d", secret)` is also out (it's a
-  forbidden *observation*, and `SetValue` wants a number, not a string anyway).
-  **The secret reaches C only through `SetValue`, untouched.**
+  op, same class as branching. (String ops split, verified in-game
+  2026-07-07: `print(secret)` and `string.format("%d", secret)` are **allowed**
+  — they render/observe without letting insecure Lua branch on the value — but
+  `secret .. anything` **concatenation errors**, same class as arithmetic. So a
+  debug line that concatenates a secret spellId into a string crashes in combat
+  while a `string.format`-based one is fine. Either way `SetValue` wants a
+  number, not a string.) **The secret reaches C only through `SetValue`,
+  untouched.**
 - StatusBar fill = `clamp((value-min)/(max-min))` is **monotonically increasing**
   in `value`. So C can compute `value >= threshold` (rising fill) but never
   `value <= threshold`. `min>max` to flip it → engine makes the range degenerate
@@ -1300,6 +1339,27 @@ global slash shortcut is gone.
    Direction ElapsedTime=0/RemainingTime=1), and the min/max question
    resolved — see the #16 update. In-game check: kick → icon + dark
    vertical drain emptying downward over ~15s.
+   **Follow-up (2026-07-07, awaiting in-game verification): the secret-cast
+   blanking IS now fixed — the "no known C-side fix" above is superseded.**
+   Confirmed in-game via `/ia debug` that arena ENEMY-player casts fire
+   `UNIT_SPELLCAST_SUCCEEDED` fine but with a SECRET spellID (via every token,
+   nameplate included; the castGUID is secret too, so no Lua recovery — see the
+   new "Verified in-game" bullets), so the Lua untracked-drop guard can't fire
+   for them and every enemy cast was still re-feeding slot 1's bars and blanking
+   a live match. Fix (`Stack.lua`): CAST mode now fans casts across a RING of
+   `CAST_GROUPS` (=10) slots — one FRESH slot per cast (`self.castRing`
+   advances; `AcquireSlot(g)`), so a matched cast's bars are never overwritten
+   by the next cast and the StatusBar's own value retention holds `value == X`
+   (icon + drain) in C for the whole cooldown. The ring IS the latch we thought
+   didn't exist. Only wrapping back to a slot (after CAST_GROUPS intervening
+   casts) recycles it, by which point its per-matcher `OnCooldownDone` has
+   usually hidden it. Each ring slot gets its own frame-level band
+   (`SetSlotLevel`) so two concurrently-visible matches don't z-fight; slots are
+   created lazily so idle units cost nothing (cost is CAST_GROUPS × tracked-id
+   count matchers per ACTIVELY-casting unit — raise/lower `CAST_GROUPS` to trade
+   spam-resilience for frames). In-game check: in arena, an enemy's kick icon +
+   drain should now persist its full cooldown while they keep casting other
+   spells, instead of blanking on their next cast.
 
    ## Outstanding Questions
    For spells where a single text string matches multiple spells, is there some way to know which is the "right" one? I see 5 rushing wind kick for example. 

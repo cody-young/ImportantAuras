@@ -209,13 +209,13 @@ ID.Presets = {
         create = function()
             ID.db.profile.stacks[ID.NewStackID()] = NewKickStack(
                 "Arena1 Kicks", "Arena Kicks",
-                { "arena1"})
+                { "arena1", "arenapet1"})
             ID.db.profile.stacks[ID.NewStackID()] = NewKickStack(
                 "Arena2 Kicks", "Arena Kicks",
-                { "arena2"})
+                { "arena2", "arenapet2"})
             ID.db.profile.stacks[ID.NewStackID()] = NewKickStack(
                 "Arena3 Kicks", "Arena Kicks",
-                { "arena3"})
+                { "arena3", "arenapet3"})
         end,
     },
     {

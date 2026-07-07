@@ -210,6 +210,22 @@ local function pr(msg)
     print("|cff66ccffImportantAuras|r: " .. tostring(msg))
 end
 
+-- Debug output, toggled with `/ia debug`. Off by default; nothing prints
+-- unless the user turns it on for a diagnostic session.
+--
+-- `print`/`string.format("%d", secret)` are valid secret sinks (even in
+-- combat); only `secret .. x` and arithmetic error. So a secret spellID is safe
+-- as a `...` arg. Whole format+print is pcall'd as a backstop.
+ID.debug = false
+function ID.dprintf(fmt, ...)
+    if ID.debug then
+        local args, n = { ... }, select("#", ...)
+        pcall(function()
+            print(string.format("|cffffcc00IA-dbg|r: " .. fmt, unpack(args, 1, n)))
+        end)
+    end
+end
+
 SLASH_IMPORTANTAURAS1 = "/ia"
 SLASH_IMPORTANTAURAS2 = "/importantauras"
 SlashCmdList["IMPORTANTAURAS"] = function(msg)
@@ -233,9 +249,14 @@ SlashCmdList["IMPORTANTAURAS"] = function(msg)
         if ID.Options and ID.Options.Rebuild then ID.Options.Rebuild() end
         pr("reset to defaults")
 
+    elseif cmd == "debug" then
+        ID.debug = not ID.debug
+        pr("debug " .. (ID.debug and "ON" or "off"))
+
     else
         pr("commands:")
         print("  /ia          - open the options window")
         print("  /ia reset    - reset all stacks back to defaults")
+        print("  /ia debug    - toggle debug logging")
     end
 end

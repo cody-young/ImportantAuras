@@ -53,7 +53,12 @@ local function CreateEntry(id, sdb)
         if sdb.filter == "CAST" then
             ev:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
             ev:SetScript("OnEvent", function(_, _, u, _, spellID)
-                if u == unit then stack:OnCast(spellID) end
+                if u == unit then
+                    -- %d on the (possibly secret) spellID is safe, see dprintf.
+                    ID.dprintf("UNIT_SPELLCAST_SUCCEEDED u=%s spell=%d secret=%s", u,
+                        spellID, tostring(issecretvalue and issecretvalue(spellID)))
+                    stack:OnCast(spellID)
+                end
             end)
         else
             ev:RegisterUnitEvent("UNIT_AURA", unit)

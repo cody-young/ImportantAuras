@@ -14,18 +14,38 @@ local addonName, ID = ...
 -- =========================================================================
 
 local MAX_AURAS = 40
+-- CAST-mode latch depth: casts fan out across a ring of this many slots (one
+-- fresh slot per cast) so a matched cast's bars aren't overwritten by the next
+-- cast -- the StatusBar retains its fed (secret) value, holding the icon/drain
+-- in C for the whole cooldown (no Lua-visible match needed). The ring recycles
+-- the oldest slot when it wraps, so a display survives at most this many
+-- intervening casts before its cooldown-end timer would hide it anyway. Bigger
+-- = survives heavier cast spam (e.g. a meleer firing every ability) but more
+-- frames (this many x tracked-id count, per casting unit). Slots are created
+-- lazily, so idle units cost nothing.
+local CAST_GROUPS = 20
 local PUNCH_MARGIN = 4 -- keeps parked punch edges off the icon (filter bleed)
 local TEX_TRANS = "Interface\\AddOns\\" .. addonName .. "\\Textures\\Trans8x8.tga"
 
 -- 12.0 secret-safe cooldown plumbing (see the cdBar block in AcquireMatcher):
 -- DurationObjects carry (possibly secret) timings from C to C without Lua
 -- ever reading them. Enum fallbacks per warcraft.wiki: Immediate = 0,
--- RemainingTime = 1.
+-- ElapsedTime = 0, RemainingTime = 1.
+--
+-- The dark drain texture's height = the bar's animated value, so the two
+-- directions read opposite: RemainingTime starts the bar full and drains it
+-- to empty (dark shrinks/UNCOVERS over time), ElapsedTime starts empty and
+-- fills to full (dark grows/COVERS over time). CAST/cooldown uses
+-- RemainingTime so the icon uncovers as the spell comes off cooldown; the
+-- aura path uses ElapsedTime so a buff/debuff covers up as it's about to
+-- wear out.
 local CreateDurationObject = C_DurationUtil and C_DurationUtil.CreateDuration
 local CD_INTERP = (Enum and Enum.StatusBarInterpolation
     and Enum.StatusBarInterpolation.Immediate) or 0
-local CD_DIR = (Enum and Enum.StatusBarTimerDirection
+local CD_DIR_COOLDOWN = (Enum and Enum.StatusBarTimerDirection
     and Enum.StatusBarTimerDirection.RemainingTime) or 1
+local CD_DIR_AURA = (Enum and Enum.StatusBarTimerDirection
+    and Enum.StatusBarTimerDirection.ElapsedTime) or 0
 
 local function GetIcon(spellID)
     local tex = C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(spellID)
@@ -100,6 +120,7 @@ local function AcquireMatcher(parent, iconSize)
         -- anchored to the same punch geometry (cdLo tracks blo's fill via
         -- RefreshPunchLoAnchors; cdHi rides bhi's fill like pHi does).
         if CreateDurationObject then
+            m.durObj = CreateDurationObject()
             m.cdBar = CreateFrame("StatusBar", nil, m)
             m.cdBar:SetAllPoints(m)
             m.cdBar:SetOrientation("VERTICAL")
@@ -122,8 +143,34 @@ local function AcquireMatcher(parent, iconSize)
                 m.cdHi:SetTexture(TEX_TRANS, "CLAMPTOWHITE", "CLAMPTOWHITE", "NEAREST")
                 m.cdHi:SetAllPoints(m.bhi:GetStatusBarTexture())
                 m.cdBar.tex:AddMaskTexture(m.cdHi)
-                m.durObj = CreateDurationObject()
                 m.cdOK = true
+            end
+
+            -- Cooldown-END signal, separate from the drain visual above. A
+            -- CAST icon must hide the moment the spell is off cooldown, but
+            -- the only cooldown source (C_Spell.GetSpellCooldown) returns
+            -- SECRET seconds (Bug #6) -- we can neither read them nor do the
+            -- arithmetic a C_Timer.After would need. A Cooldown widget fed the
+            -- SAME (secret) DurationObject via SetCooldownFromDurationObject
+            -- fires OnCooldownDone in C exactly at cooldown end, no Lua read.
+            -- Used ONLY as that timer: every draw layer is off. Its swipe is
+            -- NOT maskable (no GetSwipeTexture on this client) and would leak
+            -- on the transparent MISS matchers -- and parenting it under the
+            -- masked drain does NOT help, since masks bind to specific
+            -- textures via AddMaskTexture, not to frame children. So the
+            -- visible cooldown stays the masked StatusBar; this is invisible.
+            local cdt = CreateFrame("Cooldown", nil, m, "CooldownFrameTemplate")
+            if cdt.SetCooldownFromDurationObject then
+                cdt:SetAllPoints(m)
+                cdt:SetDrawSwipe(false)
+                cdt:SetDrawEdge(false)
+                if cdt.SetDrawBling then cdt:SetDrawBling(false) end
+                if cdt.SetHideCountdownNumbers then cdt:SetHideCountdownNumbers(true) end
+                cdt.noCooldownCount = true -- ask OmniCC & co. to skip it
+                m.cdTimer = cdt
+                m.cdTimerOK = true
+            else
+                cdt:Hide()
             end
         end
         if not m.cdOK and not ID.cdWarned then
@@ -150,9 +197,21 @@ local function ReleaseMatcher(m)
     m.castHideToken = (m.castHideToken or 0) + 1 -- orphan pending cast-expiry hides
     m:Hide()
     if m.cdOK then m.cdBar:Hide() end
+    if m.cdTimer then m.cdTimer:Clear() end -- stop the invisible OnCooldownDone timer
     m:SetParent(UIParent)
     m:ClearAllPoints()
     pool[#pool + 1] = m
+end
+
+-- Re-level a slot's frame and its matchers (rank 1 on top), mirroring
+-- BuildSlotBars. Used to give each CAST-ring slot its own frame-level band so
+-- concurrently-visible matches from different casts don't z-fight.
+local function SetSlotLevel(slot, order, level)
+    slot.frame:SetFrameLevel(level)
+    local base, n = level + 1, #order
+    for rank, m in ipairs(slot.matchers) do
+        m:SetFrameLevel(base + (n - rank))
+    end
 end
 
 -- Point a matcher at target X (plain, known). Bars start at X-1 so punchLo
@@ -286,16 +345,8 @@ function Stack:FeedSlot(slot, secretSpellId, durObj)
         RefreshPunchLoAnchors(m, self.db.iconSize)
         if m.cdOK then
             if durObj and showCD and not self.cdBroken then
-                local ok = pcall(m.cdBar.SetTimerDuration, m.cdBar, durObj,
-                    CD_INTERP, CD_DIR)
-                if ok then
-                    m.cdBar:Show()
-                else
-                    self.cdBroken = true
-                    m.cdBar:Hide()
-                    print("|cffff4444ImportantAuras|r: cooldown drain disabled for '"
-                        .. (self.db.name or "?") .. "' (SetTimerDuration rejected the aura duration)")
-                end
+                m.cdBar:SetTimerDuration(durObj, CD_INTERP, CD_DIR_AURA)
+                m.cdBar:Show()
             else
                 m.cdBar:Hide()
             end
@@ -367,16 +418,15 @@ function Stack:Scan()
             -- open and let C render whatever it computes.
             local wantCD = true
             if C_UnitAuras.DoesAuraHaveExpirationTime then
-                local okE, hasExp = pcall(C_UnitAuras.DoesAuraHaveExpirationTime,
+                local hasExp = C_UnitAuras.DoesAuraHaveExpirationTime(
                     unit, data.auraInstanceID)
-                if okE and (not issecretvalue or not issecretvalue(hasExp))
+                if (not issecretvalue or not issecretvalue(hasExp))
                     and hasExp == false then
                     wantCD = false
                 end
             end
             if wantCD then
-                local okD, d = pcall(C_UnitAuras.GetAuraDuration, unit, data.auraInstanceID)
-                if okD then durObj = d end
+                durObj = C_UnitAuras.GetAuraDuration(unit, data.auraInstanceID)
             end
         end
         self:FeedSlot(slot, data.spellId, durObj)
@@ -385,132 +435,134 @@ function Stack:Scan()
 end
 
 -- Cooldown lookup for a TRACKED id -- always m.targetID, a PLAIN int the user
--- typed, never the cast payload (which may be secret), so everything here is
--- plain data and plain decisions. Returns startTime, duration (seconds), both
--- always from the spell's static base cooldown via GetSpellBaseCooldown
--- (resolves any spell id, learned or not; talent CDR invisible to us for
--- EVERY unit including the player -- see below). A spell with no cooldown at
--- all falls back to db.castDuration (the old fixed flash).
+-- typed, never the cast payload (which may be secret). Returns startTime,
+-- duration in SECONDS straight from C_Spell.GetSpellCooldown -- the spell's
+-- LIVE cooldown (real remaining, incl. talent CDR), not a static estimate.
 --
--- C_Spell.GetSpellCooldown was tried first (as requested) for the player's
--- own cast, on the theory that it reflects the player's live cooldown state
--- including talent CDR -- REVERTED (2026-07-06) after an in-game error:
--- `cd.duration > 0` errored "a secret number value, while execution tainted
--- by 'ImportantAuras'". So the LIVE cooldown fields are secret -- same
--- restriction class as aura spellIds/nameplate names -- while the STATIC
--- base cooldown stays plain in the cases tested so far. There is no known
--- way to read "is this spell live-cooling-down and for how long" without
--- branching on a secret, so this addon can't do better than the static
--- value for anyone, player included.
+-- CRITICAL: those two fields are SECRET (Bug #6 -- `cd.duration > 0` errored
+-- "a secret number value, while execution tainted by 'ImportantAuras'"). So
+-- we NEVER read them, compare them, or do arithmetic on them here or in the
+-- caller. They are only ever handed to a DurationObject (SetTimeFromStart),
+-- which carries the secret timing from C to C -- same discipline as
+-- SetValue(secret). This replaces the old GetSpellBaseCooldown path, whose
+-- `ms / 1000` and `ms > 0` were arithmetic/branches that error in combat.
 --
--- Per CLAUDE.md's general principle (any API call is guilty of returning a
--- secret until proven otherwise, even with a plain argument), the arithmetic
--- AND the validity check on GetSpellBaseCooldown's result both happen INSIDE
--- the pcall -- a first pass left `ms / 1000` and the `<= 0` check outside it,
--- which is exactly the naked-arithmetic-on-a-maybe-secret bug this file
--- keeps having to fix. If the division/comparison errors (ms turns out
--- secret), the pcall catches it and `base` just stays 0 -> falls back to
--- castDuration, same as "no base cooldown found".
+-- Fallback (API/table missing only) is the plain fixed castDuration flash;
+-- we can't inspect duration to detect a no-cooldown spell without branching a
+-- secret, so a no-CD tracked cast simply comes off cooldown immediately.
 function Stack:ResolveCastCooldown(spellID)
-    local now = GetTime()
-    local base = 0
-    if GetSpellBaseCooldown then
-        local ok, result = pcall(function()
-            local ms = GetSpellBaseCooldown(spellID)
-            if type(ms) ~= "number" or ms <= 0 then return 0 end
-            return ms / 1000
-        end)
-        if ok and type(result) == "number" then base = result end
+    if C_Spell and C_Spell.GetSpellCooldown then
+        local cd = C_Spell.GetSpellCooldown(spellID)
+        if cd then
+            return cd.startTime, cd.duration -- SECRET seconds; do not touch
+        end
     end
-    if base <= 0 then
-        return now, self.db.castDuration or 2
-    end
-    return now, base
+    return GetTime(), self.db.castDuration or 2
 end
 
 -- Cast-mode entry point (db.filter == "CAST"): show the matching tracked
--- icon for that spell's COOLDOWN, with a cooldown swipe (Next Features #14).
--- A cast is a momentary event with no "ends" event to scan back down from,
--- so timers hide it instead. The trick that keeps this secret-safe: we never
--- learn WHICH tracked spell matched (that's decided in C by the dual punch),
--- but every matcher owns one plain tracked id, so each matcher gets ITS OWN
--- spell's cooldown swipe and its own plain hide timer -- for the one visible
--- (matched) matcher those are exactly right, and for the transparent misses
--- they're invisible no-ops. Slot 1 is reused for every cast.
+-- icon for that spell's COOLDOWN, with a cooldown drain (Next Features #14/#16).
+-- A cast is a momentary event with no "ends" event to scan back down from, so
+-- timers hide it instead. Secret-safe: we never learn WHICH tracked spell
+-- matched (C decides via the dual punch), but every matcher owns one plain
+-- tracked id, so each gets ITS OWN cooldown drain + plain hide timer -- right
+-- for the one visible (matched) matcher, invisible no-ops for the misses.
+--
+-- Each cast feeds a FRESH ring slot (not a shared slot 1): a matcher fed
+-- `value == X` keeps `value == X` until its bars are set again, so the icon
+-- holds in C for the whole cooldown. The old shared-slot code re-fed on every
+-- cast, so the next (untracked, secret-so-unfilterable) enemy cast blanked a
+-- live match -- Bug #7's "no latch" hole. The ring IS the latch: only wrapping
+-- back to a slot (after CAST_GROUPS casts) overwrites it, by which point its
+-- own cooldown-end timer has usually hidden it already.
 function Stack:OnCast(spellID)
-    -- EVERY successful cast on this unit lands here -- hidden proc/internal
-    -- spells included, plus whatever the player presses on the next GCD.
-    -- Feeding an untracked id would overwrite a live match's bar values and
-    -- the dual punch (correctly) blanks the icon on the mismatch -- so a
-    -- tracked cast's cooldown display only survived until the unit's NEXT
-    -- cast event (Bug #7's split-second flash). When the payload is PLAIN
-    -- (own casts verified plain in-game: Core.lua compares this same payload
-    -- against the round-start marker id without erroring), drop untracked
-    -- ids in Lua before they reach the bars. A secret payload can't be
-    -- compared, so it falls through and feeds C as before -- a secret miss
-    -- still blanks (bars have no latch; no known fix).
-    if not issecretvalue or not issecretvalue(spellID) then
+    -- EVERY successful cast on this unit lands here -- procs, next-GCD presses,
+    -- everything. A PLAIN payload (own/pet casts) we can filter to tracked ids
+    -- in Lua, sparing the ring needless churn; a SECRET payload (enemy player)
+    -- can't be compared, so it feeds C and the dual punch decides the match.
+    local isSecret = issecretvalue and issecretvalue(spellID)
+    if not isSecret then
         local tracked = false
         for _, X in ipairs(self.db.order) do
             if X == spellID then tracked = true; break end
         end
-        if not tracked then return end
+        if not tracked then
+            ID.dprintf("OnCast[%s] spell=%d PLAIN untracked -> ignored",
+                self.unitToken or "?", spellID)
+            return
+        end
+        ID.dprintf("OnCast[%s] spell=%d PLAIN tracked -> feeding ring",
+            self.unitToken or "?", spellID)
+    else
+        -- %d on a secret is safe (see dprintf); Lua still can't branch on it to
+        -- pick the target -- the dual punch does that match in C.
+        ID.dprintf("OnCast[%s] spell=%d [secret] -> feeding C (dual punch decides match)",
+            self.unitToken or "?", spellID)
     end
-    local slot = self:AcquireSlot(1)
+    -- Advance the ring and feed the next slot, leaving prior casts' slots (and
+    -- thus any live match they hold) untouched.
+    self.castRing = (self.castRing or 0) % CAST_GROUPS + 1
+    local g = self.castRing
+    local slot = self:AcquireSlot(g)
+    SetSlotLevel(slot, self.db.order,
+        self.anchor:GetFrameLevel() + 1 + g * (#self.db.order + 2))
     local showCD = self.db.showCooldown
-    local now = GetTime()
-    local maxRemaining = 0
     for _, m in ipairs(slot.matchers) do
         m.blo:SetValue(spellID) -- possibly secret; goes straight to C
         m.bhi:SetValue(spellID)
         RefreshPunchLoAnchors(m, self.db.iconSize)
+        m.castHideToken = (m.castHideToken or 0) + 1 -- supersede any pending hide
+        local tok = m.castHideToken
         m:Show() -- may still be hidden from a previous cast's expiry
 
-        -- start/duration are PLAIN numbers (m.targetID is the user-typed
-        -- tracked id; GetSpellBaseCooldown's result is verified plain), so
-        -- the hide-timer arithmetic below is safe. The drain still goes
-        -- through the matcher's own DurationObject so CAST and aura modes
-        -- share one display path.
+        -- start/duration come from C_Spell.GetSpellCooldown and are POSSIBLY
+        -- SECRET (Bug #6) -- never read them, compare them, or compute with
+        -- them. They flow only into the DurationObject, which drives BOTH the
+        -- drain and the cooldown-end hide entirely in C. Each matcher carries
+        -- ITS OWN tracked spell's cooldown; only the (C-decided) matched
+        -- matcher is visible, so its cooldown is the one that shows.
         local start, duration = self:ResolveCastCooldown(m.targetID)
+        if m.durObj then
+            if not pcall(m.durObj.SetTimeFromStart, m.durObj, start, duration) then
+                self.cdBroken = true
+            end
+        end
+
+        -- drain visual (masked StatusBar), gated on the user's toggle
         if m.cdOK then
             if showCD and not self.cdBroken then
-                local ok = pcall(function()
-                    m.durObj:SetTimeFromStart(start, duration)
-                    m.cdBar:SetTimerDuration(m.durObj, CD_INTERP, CD_DIR)
-                end)
-                if ok then
-                    m.cdBar:Show()
-                else
-                    self.cdBroken = true
-                    m.cdBar:Hide()
-                    print("|cffff4444ImportantAuras|r: cooldown drain disabled for '"
-                        .. (self.db.name or "?") .. "' (SetTimeFromStart/SetTimerDuration rejected the cooldown values)")
-                end
+                m.cdBar:SetTimerDuration(m.durObj, CD_INTERP, CD_DIR_COOLDOWN)
+                m.cdBar:Show()
             else
                 m.cdBar:Hide()
             end
         end
 
-        local remaining = start + duration - now
-        if remaining < 0.1 then remaining = 0.1 end
-        if remaining > maxRemaining then maxRemaining = remaining end
-        m.castHideToken = (m.castHideToken or 0) + 1
-        local tok = m.castHideToken
-        C_Timer.After(remaining, function()
-            if m.castHideToken == tok then m:Hide() end
-        end)
+        -- hide the instant the spell is off cooldown, with no plain
+        -- "remaining" and no arithmetic: the invisible Cooldown widget fires
+        -- OnCooldownDone in C at the end of this same DurationObject.
+        if m.cdTimerOK and m.durObj and not self.cdBroken then
+            m.cdTimer:SetScript("OnCooldownDone", function()
+                if m.castHideToken == tok then m:Hide() end
+            end)
+            if not pcall(m.cdTimer.SetCooldownFromDurationObject, m.cdTimer, m.durObj) then
+                self.cdBroken = true
+            end
+        end
+        if (not m.cdTimerOK) or (not m.durObj) or self.cdBroken then
+            -- No secret-safe cooldown-end signal available -- fall back to the
+            -- plain fixed flash (never touches a secret).
+            C_Timer.After(self.db.castDuration or 2, function()
+                if m.castHideToken == tok then m:Hide() end
+            end)
+        end
     end
     slot.frame:Show()
-    self:Layout(1)
-
-    -- Backstop: once every matcher's timer has run, collapse the slot too.
-    local token = (self.castToken or 0) + 1
-    self.castToken = token
-    C_Timer.After(maxRemaining + 0.1, function()
-        if not self.destroyed and self.castToken == token then
-            self:Layout(0)
-        end
-    end)
+    -- Keep the whole ring shown (empty/expired slots are transparent); the just
+    -- -fed slot's band puts its match on top of any older still-visible one.
+    self:Layout(CAST_GROUPS)
+    ID.dprintf("OnCast[%s] fed slot %d (%d matchers)",
+        self.unitToken or "?", g, #slot.matchers)
 end
 
 -- Options-GUI "Preview" (Next Features #9): light up the highest-priority
@@ -554,6 +606,7 @@ function Stack:Rebuild()
         self:BuildSlotBars(slot)
     end
     if self.db.filter == "CAST" then
+        self.castRing = 0 -- restart the latch ring; BuildSlotBars cleared held casts
         self:Layout(0) -- no persistent state to rescan; next cast repopulates
     else
         self:Scan()
