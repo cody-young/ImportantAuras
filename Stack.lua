@@ -521,10 +521,16 @@ end
 -- concurrent UNIT_AURA-driven Scan from immediately clearing it.
 local PREVIEW_SECONDS = 3
 function Stack:Preview()
-    -- Only flash where the unit actually exists, so a stack fanned out to
-    -- units that aren't present (e.g. party3 while solo, or a frame-attached
-    -- stack whose unit frame doesn't exist) doesn't show a phantom preview.
-    if self.unitToken and not UnitExists(self.unitToken) then return end
+    -- For a FRAME-ATTACHED stack, only flash where the unit actually exists --
+    -- otherwise there's no unit frame to anchor to and the fallback would show
+    -- a phantom (e.g. party3 while solo). A FREE-FLOATING stack positions at
+    -- its saved UIParent point regardless of whether the unit is present, so it
+    -- must still preview -- this is exactly the arena-kicks case (preview
+    -- arena1-3 while not in an arena, to position the column).
+    if self.unitToken and self.db.anchor.useFrame
+        and not UnitExists(self.unitToken) then
+        return
+    end
     local top = self.db.order[1]
     if not top then return end
     local slot = self:AcquireSlot(1)
